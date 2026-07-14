@@ -10,26 +10,26 @@ import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetector
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.face.FaceLandmark
-import org.tensorflow.lite.Interpreter
-import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import java.nio.FloatBuffer
 import kotlin.math.atan2
-import kotlin.math.max
 import kotlin.math.sqrt
 
 class FaceRecognitionModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
     private val faceDetector: FaceDetector
-    private var interpreter: Interpreter? = null
+
+    // ONNX Runtime: ambiente global (reutilizado entre chamadas) e sessão do modelo
+    private val ortEnv: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private var ortSession: OrtSession? = null
 
     companion object {
-        private const val MODEL_FILE = "facenet_512.tflite"
-        private const val INPUT_SIZE = 160      // FaceNet espera imagens 160x160
-        private const val EMBEDDING_SIZE = 512  // Este modelo FaceNet gera vetores de 512 dimensões
+        private const val MODEL_FILE = "w600k_r50.onnx"  // InsightFace ResNet50 — WebFace600K
+        private const val INPUT_SIZE = 112                // Entrada 112×112 (mesmo padrão ArcFace)
+        private const val EMBEDDING_SIZE = 512            // ResNet50 gera vetores de 512 dimensões
     }
 
     init {
@@ -38,13 +38,19 @@ class FaceRecognitionModule(reactContext: ReactApplicationContext) :
         val options = FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
-            .setMinFaceSize(0.1f)
+            // CLASSIFICATION_MODE_ALL habilita leftEyeOpenProbability e rightEyeOpenProbability
+            // Usamos isso para filtrar rostos de bonecas/mascotes, que não têm olhos "reais"
+            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+            .setMinFaceSize(0.05f)
             .build()
         faceDetector = FaceDetection.getClient(options)
 
         try {
-            val model = loadModelFile()
-            interpreter = Interpreter(model)
+            // Carrega o modelo via caminho de arquivo (não via bytes) para evitar OOM.
+            // readBytes() tentaria alocar 174MB no heap Java de uma só vez, causando crash.
+            // Ao usar o caminho, o ONNX Runtime faz memory-mapping nativo — muito mais eficiente.
+            val modelPath = getOrCopyModelToFiles()
+            ortSession = ortEnv.createSession(modelPath, OrtSession.SessionOptions())
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -52,15 +58,27 @@ class FaceRecognitionModule(reactContext: ReactApplicationContext) :
 
     override fun getName(): String = "FaceRecognition"
 
-    private fun loadModelFile(): MappedByteBuffer {
-        val assetFileDescriptor = reactApplicationContext.assets.openFd(MODEL_FILE)
-        val fileInputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
-        val fileChannel = fileInputStream.channel
-        return fileChannel.map(
-            FileChannel.MapMode.READ_ONLY,
-            assetFileDescriptor.startOffset,
-            assetFileDescriptor.declaredLength
-        )
+    /**
+     * Copia o modelo de assets/ para o armazenamento interno do app (filesDir)
+     * e retorna o caminho absoluto do arquivo.
+     *
+     * Na primeira execução: copia o arquivo (pode levar alguns segundos para 174MB).
+     * Nas execuções seguintes: retorna o caminho direto sem copiar de novo.
+     *
+     * Por que não carregar diretamente de assets?
+     * Assets não têm um caminho de arquivo real no sistema de arquivos — são lidos
+     * via AssetManager. O ONNX Runtime precisa de um caminho real para fazer mmap().
+     */
+    private fun getOrCopyModelToFiles(): String {
+        val dest = java.io.File(reactApplicationContext.filesDir, MODEL_FILE)
+        if (!dest.exists()) {
+            reactApplicationContext.assets.open(MODEL_FILE).use { input ->
+                java.io.FileOutputStream(dest).use { output ->
+                    input.copyTo(output, bufferSize = 8 * 1024 * 1024) // buffer de 8MB
+                }
+            }
+        }
+        return dest.absolutePath
     }
 
     /**
@@ -117,14 +135,16 @@ class FaceRecognitionModule(reactContext: ReactApplicationContext) :
     /**
      * Alinha o rosto usando as posições dos olhos detectadas pelo ML Kit.
      *
-     * O FaceNet foi treinado com rostos alinhados: olhos sempre na horizontal,
-     * na mesma posição relativa dentro do recorte. Sem esse alinhamento, a orientação
-     * da foto afeta o embedding e as comparações ficam imprecisas.
+     * O InsightFace foi treinado com rostos alinhados: olhos sempre na horizontal.
      *
-     * O que fazemos:
-     * 1. Calculamos o ângulo entre o olho esquerdo e o direito
-     * 2. Rotacionamos a imagem inteira para que os olhos fiquem na horizontal
-     * 3. Recortamos o rosto do bitmap já rotacionado
+     * Sequência correta:
+     * 1. Recorta o rosto (com padding) do bitmap original
+     * 2. Rotaciona o recorte em torno do seu próprio centro
+     * 3. Redimensiona para 112×112
+     *
+     * IMPORTANTE: a versão anterior fazia o inverso (rotacionava o bitmap inteiro
+     * e depois aplicava as coordenadas originais), o que deslocava o rosto para fora
+     * do crop e resultava em capturas de fundo em vez de rosto.
      */
     private fun alignFace(
         bitmap: Bitmap,
@@ -132,31 +152,31 @@ class FaceRecognitionModule(reactContext: ReactApplicationContext) :
         rightEyeX: Float, rightEyeY: Float,
         bounds: android.graphics.Rect
     ): Bitmap {
-        // atan2 retorna o ângulo em radianos entre o vetor (olho direito - olho esquerdo) e o eixo X
-        // Convertemos para graus para usar na Matrix do Android
+        // Passo 1: recorta o rosto com padding (já calculado em bounds)
+        val left   = maxOf(0, bounds.left)
+        val top    = maxOf(0, bounds.top)
+        val right  = minOf(bitmap.width, bounds.right)
+        val bottom = minOf(bitmap.height, bounds.bottom)
+
+        if (right <= left || bottom <= top) {
+            return Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true)
+        }
+
+        val cropped = Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+
+        // Passo 2: calcula o ângulo de inclinação dos olhos e rotaciona o recorte
+        // em torno do seu centro (não do bitmap inteiro — erro da versão anterior)
         val angle = Math.toDegrees(
             atan2((rightEyeY - leftEyeY).toDouble(), (rightEyeX - leftEyeX).toDouble())
         ).toFloat()
 
-        // Ponto de pivô da rotação: centro do rosto
-        val pivotX = (bounds.left + bounds.right) / 2f
-        val pivotY = (bounds.top + bounds.bottom) / 2f
-
-        // Matrix é a classe do Android para transformações geométricas em bitmaps
         val matrix = Matrix()
-        matrix.postRotate(-angle, pivotX, pivotY)
+        matrix.postRotate(-angle, cropped.width / 2f, cropped.height / 2f)
 
-        // Cria um novo bitmap com a imagem inteira rotacionada
-        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        val rotated = Bitmap.createBitmap(cropped, 0, 0, cropped.width, cropped.height, matrix, true)
 
-        // Recorta o rosto do bitmap rotacionado, garantindo que não saia das bordas
-        val left   = maxOf(0, bounds.left)
-        val top    = maxOf(0, bounds.top)
-        val right  = minOf(rotated.width, bounds.right)
-        val bottom = minOf(rotated.height, bounds.bottom)
-
-        val cropped = Bitmap.createBitmap(rotated, left, top, right - left, bottom - top)
-        return Bitmap.createScaledBitmap(cropped, INPUT_SIZE, INPUT_SIZE, true)
+        // Passo 3: redimensiona para o tamanho de entrada do modelo
+        return Bitmap.createScaledBitmap(rotated, INPUT_SIZE, INPUT_SIZE, true)
     }
 
     @ReactMethod
@@ -174,10 +194,44 @@ class FaceRecognitionModule(reactContext: ReactApplicationContext) :
                         return@addOnSuccessListener
                     }
 
-                    // Pega o rosto com maior área — ignora rostos pequenos de fundo,
-                    // brinquedos, mascotes ou pessoas em segundo plano
-                    val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }!!
-                    val bounds = face.boundingBox
+                    // Filtra apenas rostos com probabilidade de olhos abertos acima de 0.2
+                    // Rostos de bonecas/mascotes/pôsteres geralmente têm probabilidade nula ou muito baixa
+                    // O threshold 0.2 é intencional baixo para não rejeitar fotos com olhos semi-cerrados
+                    val humanFaces = faces.filter { f ->
+                        val leftProb  = f.leftEyeOpenProbability  ?: 0f
+                        val rightProb = f.rightEyeOpenProbability ?: 0f
+                        leftProb > 0.2f || rightProb > 0.2f
+                    }
+
+                    if (humanFaces.isEmpty()) {
+                        promise.reject("NO_FACE", "Nenhum rosto humano detectado na imagem (possível boneca ou mascote)")
+                        return@addOnSuccessListener
+                    }
+
+                    // Seleciona o rosto com maior pontuação combinada de área × confiança dos olhos.
+                    // Isso evita que mascotes/banners (que têm área grande mas olhos pouco confiáveis)
+                    // sejam preferidos em relação ao rosto humano real na foto.
+                    val face = humanFaces.maxByOrNull { f ->
+                        val area = f.boundingBox.width().toFloat() * f.boundingBox.height()
+                        // Usa o MAX dos olhos em vez da média: evita penalizar demais rostos
+                        // com um olho semi-fechado (ex: pai olhando de lado, olho parcialmente tapado).
+                        // Com a média, um olho com prob 0.02 derrubava o score inteiro.
+                        val eyeScore = maxOf(f.leftEyeOpenProbability ?: 0f, f.rightEyeOpenProbability ?: 0f)
+                        area * eyeScore
+                    }!!
+
+                    // Expande o bounding box em 30% para cada lado.
+                    // Modelos ArcFace/FaceNet foram treinados com imagens que incluem
+                    // testa, queixo e orelhas — sem esse contexto, o embedding piora muito.
+                    val rawBounds = face.boundingBox
+                    val padX = (rawBounds.width()  * 0.3f).toInt()
+                    val padY = (rawBounds.height() * 0.3f).toInt()
+                    val bounds = android.graphics.Rect(
+                        maxOf(0, rawBounds.left   - padX),
+                        maxOf(0, rawBounds.top    - padY),
+                        minOf(bitmap.width,  rawBounds.right  + padX),
+                        minOf(bitmap.height, rawBounds.bottom + padY)
+                    )
 
                     // Tenta obter os landmarks dos olhos para alinhar o rosto
                     val leftEye  = face.getLandmark(FaceLandmark.LEFT_EYE)
@@ -207,6 +261,35 @@ class FaceRecognitionModule(reactContext: ReactApplicationContext) :
                         Bitmap.createScaledBitmap(cropped, INPUT_SIZE, INPUT_SIZE, true)
                     }
 
+                    // DEBUG: salva todos os rostos detectados + o rosto selecionado final
+                    try {
+                        val cacheDir = reactApplicationContext.externalCacheDir ?: reactApplicationContext.cacheDir
+                        val slot = if (java.io.File(cacheDir, "slot1_selected.jpg").exists()) "2" else "1"
+
+                        // Salva cada rosto detectado individualmente
+                        faces.forEachIndexed { idx, f ->
+                            val b = f.boundingBox
+                            val l = maxOf(0, b.left); val t = maxOf(0, b.top)
+                            val r = minOf(bitmap.width, b.right); val bo = minOf(bitmap.height, b.bottom)
+                            if (r > l && bo > t) {
+                                val crop = Bitmap.createBitmap(bitmap, l, t, r - l, bo - t)
+                                val lEye = f.leftEyeOpenProbability ?: -1f
+                                val rEye = f.rightEyeOpenProbability ?: -1f
+                                val area = b.width() * b.height()
+                                // Nome: slot_candidato_INDEX_area_AREA_eyes_L_R.jpg
+                                val name = "slot${slot}_candidate${idx}_area${area}_L${String.format("%.2f", lEye)}_R${String.format("%.2f", rEye)}.jpg"
+                                java.io.FileOutputStream(java.io.File(cacheDir, name)).use { out ->
+                                    crop.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)
+                                }
+                            }
+                        }
+
+                        // Salva o rosto final que foi ao modelo
+                        java.io.FileOutputStream(java.io.File(cacheDir, "slot${slot}_selected.jpg")).use { out ->
+                            faceBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, out)
+                        }
+                    } catch (e: Exception) { /* ignora erros de debug */ }
+
                     val embedding = runFaceNet(faceBitmap)
 
                     val result = Arguments.createArray()
@@ -222,38 +305,43 @@ class FaceRecognitionModule(reactContext: ReactApplicationContext) :
     }
 
     /**
-     * Prepara a imagem e roda o modelo TFLite.
+     * Prepara a imagem e roda o modelo ONNX via ONNX Runtime.
      *
-     * Usa normalização por imagem (whitening): subtrai a média e divide pelo desvio padrão
-     * calculados a partir dos próprios pixels da imagem.
+     * Diferença importante em relação ao TFLite:
+     * - TFLite esperava formato NHWC: [batch, altura, largura, canais]
+     * - ONNX Runtime espera formato NCHW: [batch, canais, altura, largura]
+     *
+     * Isso significa que os pixels precisam ser agrupados por canal (R, G, B)
+     * em vez de por pixel (R G B | R G B | R G B ...).
+     *
+     * A normalização (pixel - 127.5) / 128.0 continua a mesma — é o padrão ArcFace.
      */
     private fun runFaceNet(bitmap: Bitmap): FloatArray {
         val pixels = IntArray(INPUT_SIZE * INPUT_SIZE)
         bitmap.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
 
-        val floatPixels = FloatArray(INPUT_SIZE * INPUT_SIZE * 3)
-        var idx = 0
-        for (pixel in pixels) {
-            floatPixels[idx++] = (pixel shr 16 and 0xFF).toFloat()
-            floatPixels[idx++] = (pixel shr 8  and 0xFF).toFloat()
-            floatPixels[idx++] = (pixel        and 0xFF).toFloat()
+        // Formato NCHW com ordem BGR.
+        // Testes empíricos mostraram que BGR produz embeddings melhores com o w600k_r50,
+        // possivelmente porque o modelo ONNX foi exportado sem a conversão BGR→RGB do blobFromImages.
+        // Android Bitmap armazena ARGB: bits 23-16 = R, 15-8 = G, 7-0 = B.
+        val floatArray = FloatArray(3 * INPUT_SIZE * INPUT_SIZE)
+        val planeSize = INPUT_SIZE * INPUT_SIZE
+
+        for (i in pixels.indices) {
+            val pixel = pixels[i]
+            floatArray[i]                 = ((pixel        and 0xFF).toFloat() - 127.5f) / 128.0f  // B (canal 0)
+            floatArray[planeSize + i]     = ((pixel shr 8  and 0xFF).toFloat() - 127.5f) / 128.0f  // G (canal 1)
+            floatArray[2 * planeSize + i] = ((pixel shr 16 and 0xFF).toFloat() - 127.5f) / 128.0f  // R (canal 2)
         }
 
-        val mean = floatPixels.average().toFloat()
-        val variance = floatPixels.map { (it - mean) * (it - mean) }.average().toFloat()
-        val std = sqrt(variance)
-        val adjustedStd = max(std, 1f / sqrt(floatPixels.size.toFloat()))
+        val shape = longArrayOf(1, 3, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())
+        val tensor = OnnxTensor.createTensor(ortEnv, FloatBuffer.wrap(floatArray), shape)
 
-        val byteBuffer = ByteBuffer.allocateDirect(1 * INPUT_SIZE * INPUT_SIZE * 3 * 4)
-        byteBuffer.order(ByteOrder.nativeOrder())
-        for (value in floatPixels) {
-            byteBuffer.putFloat((value - mean) / adjustedStd)
-        }
+        // Obtém o nome da entrada dinamicamente (evita hardcode que varia por modelo)
+        val inputName = ortSession!!.inputNames.iterator().next()
+        val results = ortSession!!.run(mapOf(inputName to tensor))
 
-        val output = Array(1) { FloatArray(EMBEDDING_SIZE) }
-        interpreter?.run(byteBuffer, output)
-
-        return output[0]
+        return (results[0].value as Array<FloatArray>)[0]
     }
 
     /**
