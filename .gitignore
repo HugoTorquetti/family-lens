@@ -73,3 +73,10 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+posts-linkedin/
+
+# Fotos de debug e testes — ficam só localmente, nunca vão para o GitHub
+debug_*/
+*.log
+crash*.logandroid/app/src/main/assets/*.onnx 

@@ -66,7 +66,7 @@ export default function App() {
         photo1.embedding,
         photo2.embedding,
       );
-      setResult({ distance, match: distance < 0.6 });
+      setResult({ distance, match: distance < 0.72 });
     } catch (error: any) {
       Alert.alert('Erro ao comparar', error.message);
     } finally {
@@ -185,8 +185,8 @@ function ResultCard({ result }: ResultCardProps) {
       </Text>
       <Text style={styles.resultHint}>
         {isMatch
-          ? 'Abaixo do threshold de 0.6 — os rostos são similares.'
-          : 'Acima do threshold de 0.6 — os rostos são distintos.'}
+          ? 'Abaixo do threshold de 0.72 — os rostos são similares.'
+          : 'Acima do threshold de 0.72 — os rostos são distintos.'}
       </Text>
     </View>
   );
